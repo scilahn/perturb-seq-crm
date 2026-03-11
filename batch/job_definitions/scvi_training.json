@@ -1,0 +1,27 @@
+{
+  "jobDefinitionName": "perturb-seq-scvi-training",
+  "type": "container",
+  "containerProperties": {
+    "image": "ACCOUNT_ID.dkr.ecr.us-west-2.amazonaws.com/perturb-seq-crm:latest",
+    "vcpus": 4,
+    "memory": 32768,
+    "jobRoleArn": "arn:aws:iam::ACCOUNT_ID:role/perturb-seq-batch-role",
+    "environment": [
+      {"name": "DATASET", "value": ""},
+      {"name": "OUTPUT_PREFIX", "value": "s3://learn-perturb-seq/results/model_checkpoints/"}
+    ],
+    "command": ["python", "-m", "crm.perturbation_analysis.embeddings", "--mode", "scvi"],
+    "mountPoints": [],
+    "volumes": [],
+    "logConfiguration": {
+      "logDriver": "awslogs",
+      "options": {
+        "awslogs-group": "/aws/batch/perturb-seq-crm",
+        "awslogs-region": "us-west-2",
+        "awslogs-stream-prefix": "scvi"
+      }
+    }
+  },
+  "retryStrategy": {"attempts": 2},
+  "timeout": {"attemptDurationSeconds": 21600}
+}

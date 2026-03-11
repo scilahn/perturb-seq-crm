@@ -1,0 +1,27 @@
+{
+  "jobDefinitionName": "perturb-seq-cross-dataset-meta",
+  "type": "container",
+  "containerProperties": {
+    "image": "ACCOUNT_ID.dkr.ecr.us-west-2.amazonaws.com/perturb-seq-crm:latest",
+    "vcpus": 8,
+    "memory": 65536,
+    "jobRoleArn": "arn:aws:iam::ACCOUNT_ID:role/perturb-seq-batch-role",
+    "environment": [
+      {"name": "DATASET", "value": ""},
+      {"name": "OUTPUT_PREFIX", "value": "s3://learn-perturb-seq/results/tables/cross_dataset/"}
+    ],
+    "command": ["python", "-m", "crm.gwas_crossref.gwas_catalog", "--mode", "meta"],
+    "mountPoints": [],
+    "volumes": [],
+    "logConfiguration": {
+      "logDriver": "awslogs",
+      "options": {
+        "awslogs-group": "/aws/batch/perturb-seq-crm",
+        "awslogs-region": "us-west-2",
+        "awslogs-stream-prefix": "cross_dataset"
+      }
+    }
+  },
+  "retryStrategy": {"attempts": 2},
+  "timeout": {"attemptDurationSeconds": 14400}
+}
