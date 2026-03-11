@@ -7,6 +7,7 @@ pydeseq2>=0.4.0
 boto3>=1.34.0
 gseapy>=1.1.0
 scrublet>=0.2.3
+scperturb
 numpy
 pandas
 scipy
