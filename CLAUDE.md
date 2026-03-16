@@ -188,6 +188,111 @@ aws s3 ls s3://learn-perturb-seq/processed/ --recursive
 Scale up to `r7i.8xlarge` (256GB) for genome-scale Replogle datasets.  
 Use `g4dn.2xlarge` (NVIDIA T4, 32GB GPU RAM) for scVI / CPA model training.
 
+## EBS Snapshot / Restore Lifecycle
+
+Use this workflow to avoid paying for idle EBS storage (~$8/mo for 100 GB gp3).
+Snapshots cost ~$0.05/GB-month on compressed/incremental size (~$1-2/mo effective).
+
+### End of Session — Snapshot → Detach → Delete
+```bash
+# 1. Get your instance ID and volume ID
+INSTANCE_ID=$(aws ec2 describe-instances \
+  --filters "Name=tag:Name,Values=perturb-seq-dev" \
+  --query "Reservations[0].Instances[0].InstanceId" \
+  --output text)
+
+VOLUME_ID=$(aws ec2 describe-instances \
+  --instance-ids $INSTANCE_ID \
+  --query "Reservations[0].Instances[0].BlockDeviceMappings[0].Ebs.VolumeId" \
+  --output text)
+
+# 2. Stop the instance
+aws ec2 stop-instances --instance-ids $INSTANCE_ID
+aws ec2 wait instance-stopped --instance-ids $INSTANCE_ID
+
+# 3. Create snapshot with a descriptive tag
+SNAPSHOT_ID=$(aws ec2 create-snapshot \
+  --volume-id $VOLUME_ID \
+  --description "perturb-seq-dev $(date +%Y-%m-%d)" \
+  --tag-specifications 'ResourceType=snapshot,Tags=[{Key=Name,Value=perturb-seq-dev},{Key=Project,Value=perturb-seq-crm}]' \
+  --query "SnapshotId" --output text)
+
+echo "Snapshot ID: $SNAPSHOT_ID"
+aws ec2 wait snapshot-completed --snapshot-ids $SNAPSHOT_ID
+
+# 4. Detach and delete the volume
+aws ec2 detach-volume --volume-id $VOLUME_ID
+aws ec2 wait volume-available --volume-ids $VOLUME_ID
+aws ec2 delete-volume --volume-id $VOLUME_ID
+echo "Volume $VOLUME_ID deleted. Snapshot $SNAPSHOT_ID retained."
+```
+
+### Start of Session — Restore → Attach → Mount
+```bash
+# 1. Get the latest snapshot
+SNAPSHOT_ID=$(aws ec2 describe-snapshots \
+  --filters "Name=tag:Name,Values=perturb-seq-dev" \
+  --query "sort_by(Snapshots, &StartTime)[-1].SnapshotId" \
+  --output text)
+
+echo "Restoring from: $SNAPSHOT_ID"
+
+# 2. Create volume from snapshot (match your instance AZ)
+AZ=$(aws ec2 describe-instances \
+  --instance-ids $INSTANCE_ID \
+  --query "Reservations[0].Instances[0].Placement.AvailabilityZone" \
+  --output text)
+VOLUME_ID=$(aws ec2 create-volume \
+  --snapshot-id $SNAPSHOT_ID \
+  --availability-zone $AZ \
+  --volume-type gp3 \
+  --tag-specifications 'ResourceType=volume,Tags=[{Key=Name,Value=perturb-seq-dev}]' \
+  --query "VolumeId" --output text)
+
+aws ec2 wait volume-available --volume-ids $VOLUME_ID
+echo "Volume ready: $VOLUME_ID"
+
+# 3. Start instance and attach volume
+INSTANCE_ID=$(aws ec2 describe-instances \
+  --filters "Name=tag:Name,Values=perturb-seq-dev" \
+  --query "Reservations[0].Instances[0].InstanceId" \
+  --output text)
+
+aws ec2 start-instances --instance-ids $INSTANCE_ID
+aws ec2 wait instance-running --instance-ids $INSTANCE_ID
+
+aws ec2 attach-volume \
+  --volume-id $VOLUME_ID \
+  --instance-id $INSTANCE_ID \
+  --device /dev/xvda
+
+echo "Volume $VOLUME_ID attached. SSH in and verify mount."
+```
+
+### Snapshot Hygiene
+
+Keep only the 2 most recent snapshots to avoid accumulating storage costs:
+```bash
+# List snapshots sorted by date
+aws ec2 describe-snapshots \
+  --filters "Name=tag:Name,Values=perturb-seq-dev" \
+  --query "sort_by(Snapshots, &StartTime)[*].[SnapshotId,StartTime,Description]" \
+  --output table
+
+# Delete an old snapshot by ID
+aws ec2 delete-snapshot --snapshot-id snap-XXXXXXXXXXXXXXXXX
+```
+```bash
+# 1. Get the latest snapshot
+SNAPSHOT_ID=$(aws ec2 describe-snapshots \
+  --filters "Name=tag:Name,Values=perturb-seq-dev" \
+  --query "sort_by(Snapshots, &StartTime)[-1].SnapshotId" \
+  --output text)
+
+echo "Restoring from: $SNAPSHOT_ID"
+```
+
+
 ### Batch jobs (heavy compute)
 
 Heavy jobs (genome-scale DE, scVI training, cross-dataset meta-analysis) should
@@ -201,27 +306,51 @@ definitions. Use Spot Instance fleets for 60–80% cost reduction.
 git clone https://github.com/scilahn/perturb-seq-crm.git
 cd perturb-seq-crm
 
-# Create conda environment
-conda env create -f envs/environment.yml
-conda activate perturb-seq-crm
+# Install uv if not already present
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source $HOME/.local/bin/env  # or restart shell
 
-# Install src as editable package
-pip install -e .
+# Create virtual environment and install dependencies
+uv venv .venv --python 3.11
+source .venv/bin/activate
+uv pip install -e ".[dev]"
 
 # Verify key packages
 python -c "import pertpy; import scvi; import scanpy; print('Environment OK')"
 ```
 
-### Core package versions (pinned in environment.yml)
+### Core package versions (pinned in pyproject.toml)
 
-```
-pertpy >= 0.7.0
-scvi-tools >= 1.1.0
-scanpy >= 1.10.0
-anndata >= 0.10.0
-decoupler >= 1.6.0
-pydeseq2 >= 0.4.0
-boto3 >= 1.34.0
+```toml
+[project]
+name = "perturb-seq-crm"
+version = "0.1.0"
+requires-python = ">=3.11"
+
+dependencies = [
+    "scanpy>=1.10",
+    "pertpy>=0.7",
+    "scvi-tools>=1.1",
+    "anndata>=0.10",
+    "pandas",
+    "numpy",
+    "matplotlib",
+    "seaborn",
+    "boto3",
+    "s3fs",
+]
+
+[project.optional-dependencies]
+dev = [
+    "jupyter",
+    "ipykernel",
+    "ruff",
+    "pytest",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 ```
 
 ---
@@ -245,12 +374,12 @@ Update the status markers below as phases are completed.
 **Goal:** Working compute environment, data access confirmed, AnnData fluency.
 
 Key tasks:
-- [ ] Launch EC2 `r7i.4xlarge`, configure JupyterLab + Claude Code SSH access
-- [ ] Set up S3 bucket `s3://learn-perturb-seq` with folder structure above
-- [ ] Initialize this repo with directory structure; push first commit
-- [ ] Download 2–3 small scPerturb .h5ad datasets (< 5GB each) to validate pipeline
-- [ ] Complete `notebooks/00_pipeline_dev/00a_anndata_basics.ipynb`
-- [ ] Verify: can load `.h5ad`, inspect `adata.obs['perturbation']`, identify control cells
+- [x] Launch EC2 `r7i.4xlarge`, configure JupyterLab + Claude Code SSH access
+- [x] Set up S3 bucket `s3://learn-perturb-seq` with folder structure above
+- [x] Initialize this repo with directory structure; push first commit
+- [x] Download 2–3 small scPerturb .h5ad datasets (< 5GB each) to validate pipeline
+- [x] Complete `notebooks/00_pipeline_dev/00a_anndata_basics.ipynb`
+- [x] Verify: can load `.h5ad`, inspect `adata.obs['perturbation']`, identify control cells
 
 **Checkpoint:** EC2 running → JupyterLab accessible → scPerturb files in S3 → AnnData loaded correctly.
 
@@ -506,9 +635,3 @@ When working with Claude Code in this repo:
 | Replogle 2022 data portal | gwps.wi.mit.edu | Raw processed data for genome-scale screen |
 
 ---
-
-## 12. Contact
-
-Richard Ahn, PhD  
-sungho.richard@gmail.com | (858) 336-4846  
-https://scholar.google.com/citations?user=zvqPwUcAAAAJ&hl=en
